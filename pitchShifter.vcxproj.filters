@@ -15,15 +15,21 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="pitchshifter.cpp">
+    <ClCompile Include="Wave.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
-    <ClCompile Include="Wave.cpp">
+    <ClCompile Include="PitchShifter.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="main.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Wave.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="PitchShifter.h">
       <Filter>头文件</Filter>
     </ClInclude>
   </ItemGroup>

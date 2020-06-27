@@ -1,52 +1,4 @@
-/****************************************************************************
-*
-* NAME: smbPitchShift.cpp
-* VERSION: 1.2
-* HOME URL: http://blogs.zynaptiq.com/bernsee
-* KNOWN BUGS: none
-*
-* SYNOPSIS: Routine for doing pitch shifting while maintaining
-* duration using the Short Time Fourier Transform.
-*
-* DESCRIPTION: The routine takes a pitchShift factor value which is between 0.5
-* (one octave down) and 2. (one octave up). A value of exactly 1 does not change
-* the pitch. numSampsToProcess tells the routine how many samples in indata[0...
-* numSampsToProcess-1] should be pitch shifted and moved to outdata[0 ...
-* numSampsToProcess-1]. The two buffers can be identical (ie. it can process the
-* data in-place). fftFrameSize defines the FFT frame size used for the
-* processing. Typical values are 1024, 2048 and 4096. It may be any value <=
-* MAX_FRAME_LENGTH but it MUST be a power of 2. osamp is the STFT
-* oversampling factor which also determines the overlap between adjacent STFT
-* frames. It should at least be 4 for moderate scaling ratios. A value of 32 is
-* recommended for best quality. sampleRate takes the sample rate for the signal
-* in unit Hz, ie. 44100 for 44.1 kHz audio. The data passed to the routine in
-* indata[] should be in the range [-1.0, 1.0), which is also the output range
-* for the data, make sure you scale the data accordingly (for 16bit signed integers
-* you would have to divide (and multiply) by 32768).
-*
-* COPYRIGHT 1999-2015 Stephan M. Bernsee <s.bernsee [AT] zynaptiq [DOT] com>
-*
-*                         The Wide Open License (WOL)
-*
-* Permission to use, copy, modify, distribute and sell this software and its
-* documentation for any purpose is hereby granted without fee, provided that
-* the above copyright notice and this license appear in all source copies.
-* THIS SOFTWARE IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY OF
-* ANY KIND. See http://www.dspguru.com/wol.htm for more information.
-*
-*****************************************************************************/
-
-#if defined(SMBPITCHSHIFT_BUILD_DLL)
-#define SMTPITCHSHIFT_API __declspec(dllexport)
-#elif defined(SMPPITCHSHIFT_USE_DLL)
-#define SMTPITCHSHIFT_API __declspec(dllimport)
-#else
-#define SMTPITCHSHIFT_API
-#endif
-
-SMTPITCHSHIFT_API void smbPitchShift(float pitchShift, long numSampsToProcess, long fftFrameSize, long osamp, float sampleRate, float *indata, float *outdata);
-#define MAX_FRAME_LENGTH 8192
-
+#include "PitchShifter.h"
 
 #include <string.h>
 #include <math.h>
@@ -55,11 +7,7 @@ SMTPITCHSHIFT_API void smbPitchShift(float pitchShift, long numSampsToProcess, l
 
 #define M_PI 3.14159265358979323846f
 #define M_1_PI     0.318309886183790671538f
-void smbFft(float *fftBuffer, long fftFrameSize, long sign);
-float smbAtan2(float x, float y);
 
-
-// -----------------------------------------------------------------------------------------------------------------
 
 #define FAST_MATH_TABLE_SIZE  512
 
@@ -160,8 +108,7 @@ const float sinTable_f32[FAST_MATH_TABLE_SIZE + 1] = {
 	-0.04906767f, -0.03680722f, -0.02454123f, -0.01227154f, -0.00000000f
 };
 
-inline float  fastsin(
-	float x)
+float fastsin(float x)
 {
 	float sinVal, fract, in;                           /* Temporary variables for input, output */
 	unsigned short  index;                                        /* Index variable */
@@ -207,8 +154,7 @@ inline float  fastsin(
 	return (sinVal);
 }
 
-inline float  fastcos(
-	float x)
+float  fastcos(float x)
 {
 	float cosVal, fract, in;                   /* Temporary variables for input, output */
 	unsigned short index;                                /* Index variable */
@@ -284,291 +230,35 @@ float fastSqrt(float v)
 	return v*y;
 }
 
-void smbPitchShift(float pitchShift, long numSampsToProcess, long fftFrameSize, long osamp, float sampleRate, float *indata, float *outdata)
 /*
-Routine smbPitchShift(). See top of file for explanation
-Purpose: doing pitch shifting while maintaining duration using the Short
-Time Fourier Transform.
-Author: (c)1999-2015 Stephan M. Bernsee <s.bernsee [AT] zynaptiq [DOT] com>
+
+12/12/02, smb
+
+PLEASE NOTE:
+
+There have been some reports on domain errors when the atan2() function was used
+as in the above code. Usually, a domain error should not interrupt the program flow
+(maybe except in Debug mode) but rather be handled "silently" and a global variable
+should be set according to this error. However, on some occasions people ran into
+this kind of scenario, so a replacement atan2() function is provided here.
+
+If you are experiencing domain errors and your program stops, simply replace all
+instances of atan2() with calls to the smbAtan2() function below.
+
 */
+float smbAtan2(float x, float y)
 {
+	float signx;
+	if (x > 0.0f) signx = 1.0f;
+	else signx = -1.0f;
 
-	static float gInFIFO[MAX_FRAME_LENGTH];
-	static float gOutFIFO[MAX_FRAME_LENGTH];
-	static float gFFTworksp[2 * MAX_FRAME_LENGTH];
-	static float gLastPhase[MAX_FRAME_LENGTH / 2 + 1];
-	static float gSumPhase[MAX_FRAME_LENGTH / 2 + 1];
-	static float gOutputAccum[2 * MAX_FRAME_LENGTH];
-	static float gAnaFreq[MAX_FRAME_LENGTH];
-	static float gAnaMagn[MAX_FRAME_LENGTH];
-	static float gSynFreq[MAX_FRAME_LENGTH];
-	static float gSynMagn[MAX_FRAME_LENGTH];
-	static long gRover = false, gInit = false;
-	float   phase, tmp, real, imag;
+	if (x == 0.0f) return 0.0f;
+	if (y == 0.0f) return signx * M_PI / 2.0f;
 
-	long i, k, qpd, index;
-	float M_2PI = 2.0f*M_PI;
-	float W_2PI = M_2PI / fftFrameSize;
-	/* set up some handy variables */
-	long fftFrameSize2 = fftFrameSize / 2;
-	long stepSize = fftFrameSize / osamp;
-	float freqPerBin = sampleRate / (float)fftFrameSize;
-	float expct = W_2PI*(float)stepSize;
-	float pi_osamp = (M_2PI / osamp);
-	float pi_osamp_expct = pi_osamp + expct;
-	float pi_osamp_freqPerBin = pi_osamp / freqPerBin;
-	float osamp_freqPerBin = osamp* freqPerBin / M_2PI;
-	float fft_osamp = 1.0f / (fftFrameSize2*osamp);
-
-	long inFifoLatency = fftFrameSize - stepSize;
-	if (gRover == false)
-		gRover = inFifoLatency;
-
-	/* initialize our static arrays */
-	if (gInit == false) {
-		memset(gInFIFO, 0, MAX_FRAME_LENGTH * sizeof(float));
-		memset(gOutFIFO, 0, MAX_FRAME_LENGTH * sizeof(float));
-		memset(gFFTworksp, 0, 2 * MAX_FRAME_LENGTH * sizeof(float));
-		memset(gLastPhase, 0, (MAX_FRAME_LENGTH / 2 + 1) * sizeof(float));
-		memset(gSumPhase, 0, (MAX_FRAME_LENGTH / 2 + 1) * sizeof(float));
-		memset(gOutputAccum, 0, 2 * MAX_FRAME_LENGTH * sizeof(float));
-		memset(gAnaFreq, 0, MAX_FRAME_LENGTH * sizeof(float));
-		memset(gAnaMagn, 0, MAX_FRAME_LENGTH * sizeof(float));
-		gInit = true;
-	}
-
-	/* main processing loop */
-	for (i = 0; i < numSampsToProcess; i++) {
-
-		/* As long as we have not yet collected enough data just read in */
-		gInFIFO[gRover] = indata[i];
-		outdata[i] = gOutFIFO[gRover - inFifoLatency];
-		gRover++;
-
-		/* now we have enough data for processing */
-		if (gRover >= fftFrameSize) {
-			gRover = inFifoLatency;
-
-			/* do windowing and re,im interleave */
-			float * sFFTworksp = gFFTworksp;
-			for (k = 0; k < fftFrameSize; k++) {
-				sFFTworksp[0] = gInFIFO[k] * (-0.5f*fastcos(W_2PI*k) + 0.5f);
-				sFFTworksp[1] = 0.0f;
-				sFFTworksp += 2;
-			}
-			/* ***************** ANALYSIS ******************* */
-			/* do transform */
-			smbFft(gFFTworksp, fftFrameSize, -1);
-
-			/* this is the analysis step */
-			float *pFFTworksp = gFFTworksp;
-			for (k = 0; k <= fftFrameSize2; k++) {
-				/* de-interlace FFT buffer */
-				real = pFFTworksp[0];
-				imag = pFFTworksp[1];
-				/* compute magnitude and phase */
-				gAnaMagn[k] = 2.0f*fastSqrt(real*real + imag*imag);
-				phase = fastAtan2(imag, real);
-				/* compute phase difference */
-				/* subtract expected phase difference */
-				tmp = (phase - gLastPhase[k]) - (float)k*expct;
-				gLastPhase[k] = phase;
-
-				/* map delta phase into +/- Pi interval */
-				qpd = tmp * M_1_PI;
-				if (qpd >= 0)
-					qpd += qpd & 1;
-				else
-					qpd -= qpd & 1;
-				/* get deviation from bin frequency from the +/- Pi interval */
-				/* compute the k-th partials' true frequency */
-				/* store magnitude and true frequency in analysis arrays */
-				gAnaFreq[k] = (k + (tmp - M_PI*qpd)  * osamp_freqPerBin);
-				pFFTworksp += 2;
-			}
-
-			/* ***************** PROCESSING ******************* */
-			/* this does the actual pitch shifting */
-			memset(gSynMagn, 0, fftFrameSize * sizeof(float));
-			memset(gSynFreq, 0, fftFrameSize * sizeof(float));
-			for (k = 0; k <= fftFrameSize2; k++) {
-				index = k*pitchShift;
-				if (index <= fftFrameSize2) {
-					gSynMagn[index] += gAnaMagn[k];
-					gSynFreq[index] = gAnaFreq[k] * pitchShift;
-				}
-			}
-
-			/* ***************** SYNTHESIS ******************* */
-			/* this is the synthesis step */
-			float *tFFTworksp = gFFTworksp;
-			for (k = 0; k <= fftFrameSize2; k++) {
-				gSumPhase[k] += pi_osamp_freqPerBin * gSynFreq[k] - pi_osamp_expct*k;
-				tFFTworksp[0] = gSynMagn[k] * fastcos(gSumPhase[k]);
-				tFFTworksp[1] = gSynMagn[k] * fastsin(gSumPhase[k]);
-				tFFTworksp += 2;
-			}
-
-			/* zero negative frequencies */
-			memset(gFFTworksp + (fftFrameSize + 2), 0, sizeof(float) * 2 * fftFrameSize);
-			/* do inverse transform */
-			smbFft(gFFTworksp, fftFrameSize, 1);
-			/* do windowing and add to output accumulator */
-			float *ppFFTworksp = gFFTworksp;
-			for (k = 0; k < fftFrameSize; k++) {
-				gOutputAccum[k] += (-fastcos(W_2PI*k) *ppFFTworksp[0] * fft_osamp) + ppFFTworksp[0] * fft_osamp;
-				ppFFTworksp += 2;
-			}
-			memcpy(gOutFIFO, gOutputAccum, stepSize * sizeof(float));
-			/* shift accumulator */
-			memmove(gOutputAccum, gOutputAccum + stepSize, fftFrameSize * sizeof(float));
-			/* move input FIFO */
-			memcpy(gInFIFO, gInFIFO + stepSize, sizeof(float)*inFifoLatency);
-		}
-	}
+	return fastAtan2(x, y);
 }
-
-void smbPitchShift2(float pitchShift, long numSampsToProcess, long fftFrameSize, long osamp, float sampleRate, short* indata, short *outdata)
-{
-	static float gInFIFO[MAX_FRAME_LENGTH];
-	static float gOutFIFO[MAX_FRAME_LENGTH];
-	static float gFFTworksp[2 * MAX_FRAME_LENGTH];
-	static float gLastPhase[MAX_FRAME_LENGTH / 2 + 1];
-	static float gSumPhase[MAX_FRAME_LENGTH / 2 + 1];
-	static float gOutputAccum[2 * MAX_FRAME_LENGTH];
-	static float gAnaFreq[MAX_FRAME_LENGTH];
-	static float gAnaMagn[MAX_FRAME_LENGTH];
-	static float gSynFreq[MAX_FRAME_LENGTH];
-	static float gSynMagn[MAX_FRAME_LENGTH];
-	static long gRover = false, gInit = false;
-	float   phase, tmp, real, imag;
-
-	long i, k, qpd, index;
-	float M_2PI = 2.0f*M_PI;
-	float W_2PI = M_2PI / fftFrameSize;
-	/* set up some handy variables */
-	long fftFrameSize2 = fftFrameSize / 2;
-	long stepSize = fftFrameSize / osamp;
-	float freqPerBin = sampleRate / (float)fftFrameSize;
-	float expct = W_2PI*(float)stepSize;
-	float pi_osamp = (M_2PI / osamp);
-	float pi_osamp_expct = pi_osamp + expct;
-	float pi_osamp_freqPerBin = pi_osamp / freqPerBin;
-	float osamp_freqPerBin = osamp* freqPerBin / M_2PI;
-	float fft_osamp = 1.0f / (fftFrameSize2*osamp);
-
-	long inFifoLatency = fftFrameSize - stepSize;
-	if (gRover == false)
-		gRover = inFifoLatency;
-
-	/* initialize our static arrays */
-	if (gInit == false) {
-		memset(gInFIFO, 0, MAX_FRAME_LENGTH * sizeof(float));
-		memset(gOutFIFO, 0, MAX_FRAME_LENGTH * sizeof(float));
-		memset(gFFTworksp, 0, 2 * MAX_FRAME_LENGTH * sizeof(float));
-		memset(gLastPhase, 0, (MAX_FRAME_LENGTH / 2 + 1) * sizeof(float));
-		memset(gSumPhase, 0, (MAX_FRAME_LENGTH / 2 + 1) * sizeof(float));
-		memset(gOutputAccum, 0, 2 * MAX_FRAME_LENGTH * sizeof(float));
-		memset(gAnaFreq, 0, MAX_FRAME_LENGTH * sizeof(float));
-		memset(gAnaMagn, 0, MAX_FRAME_LENGTH * sizeof(float));
-		gInit = true;
-	}
-
-	/* main processing loop */
-	for (i = 0; i < numSampsToProcess; i++) 
-	{
-		/* As long as we have not yet collected enough data just read in */
-		gInFIFO[gRover] = 1.0 * indata[i] / 32768;
-		outdata[i] = gOutFIFO[gRover - inFifoLatency] * 32768;
-		gRover++;
-
-		/* now we have enough data for processing */
-		if (gRover >= fftFrameSize) {
-			gRover = inFifoLatency;
-
-			/* do windowing and re,im interleave */
-			float * sFFTworksp = gFFTworksp;
-			for (k = 0; k < fftFrameSize; k++) {
-				sFFTworksp[0] = gInFIFO[k] * (-0.5f*fastcos(W_2PI*k) + 0.5f);
-				sFFTworksp[1] = 0.0f;
-				sFFTworksp += 2;
-			}
-			/* ***************** ANALYSIS ******************* */
-			/* do transform */
-			smbFft(gFFTworksp, fftFrameSize, -1);
-
-			/* this is the analysis step */
-			float *pFFTworksp = gFFTworksp;
-			for (k = 0; k <= fftFrameSize2; k++) {
-				/* de-interlace FFT buffer */
-				real = pFFTworksp[0];
-				imag = pFFTworksp[1];
-				/* compute magnitude and phase */
-				gAnaMagn[k] = 2.0f*fastSqrt(real*real + imag*imag);
-				phase = fastAtan2(imag, real);
-				/* compute phase difference */
-				/* subtract expected phase difference */
-				tmp = (phase - gLastPhase[k]) - (float)k*expct;
-				gLastPhase[k] = phase;
-
-				/* map delta phase into +/- Pi interval */
-				qpd = tmp * M_1_PI;
-				if (qpd >= 0)
-					qpd += qpd & 1;
-				else
-					qpd -= qpd & 1;
-				/* get deviation from bin frequency from the +/- Pi interval */
-				/* compute the k-th partials' true frequency */
-				/* store magnitude and true frequency in analysis arrays */
-				gAnaFreq[k] = (k + (tmp - M_PI*qpd)  * osamp_freqPerBin);
-				pFFTworksp += 2;
-			}
-
-			/* ***************** PROCESSING ******************* */
-			/* this does the actual pitch shifting */
-			memset(gSynMagn, 0, fftFrameSize * sizeof(float));
-			memset(gSynFreq, 0, fftFrameSize * sizeof(float));
-			for (k = 0; k <= fftFrameSize2; k++) {
-				index = k*pitchShift;
-				if (index <= fftFrameSize2) {
-					gSynMagn[index] += gAnaMagn[k];
-					gSynFreq[index] = gAnaFreq[k] * pitchShift;
-				}
-			}
-
-			/* ***************** SYNTHESIS ******************* */
-			/* this is the synthesis step */
-			float *tFFTworksp = gFFTworksp;
-			for (k = 0; k <= fftFrameSize2; k++) {
-				gSumPhase[k] += pi_osamp_freqPerBin * gSynFreq[k] - pi_osamp_expct*k;
-				tFFTworksp[0] = gSynMagn[k] * fastcos(gSumPhase[k]);
-				tFFTworksp[1] = gSynMagn[k] * fastsin(gSumPhase[k]);
-				tFFTworksp += 2;
-			}
-
-			/* zero negative frequencies */
-			memset(gFFTworksp + (fftFrameSize + 2), 0, sizeof(float) * 2 * fftFrameSize);
-			/* do inverse transform */
-			smbFft(gFFTworksp, fftFrameSize, 1);
-			/* do windowing and add to output accumulator */
-			float *ppFFTworksp = gFFTworksp;
-			for (k = 0; k < fftFrameSize; k++) {
-				gOutputAccum[k] += (-fastcos(W_2PI*k) *ppFFTworksp[0] * fft_osamp) + ppFFTworksp[0] * fft_osamp;
-				ppFFTworksp += 2;
-			}
-			memcpy(gOutFIFO, gOutputAccum, stepSize * sizeof(float));
-			/* shift accumulator */
-			memmove(gOutputAccum, gOutputAccum + stepSize, fftFrameSize * sizeof(float));
-			/* move input FIFO */
-			memcpy(gInFIFO, gInFIFO + stepSize, sizeof(float)*inFifoLatency);
-		}
-	}
-}
-
 // -----------------------------------------------------------------------------------------------------------------
 
-
-void smbFft(float *fftBuffer, long fftFrameSize, long sign)
 /*
 FFT routine, (C)1996 S.M.Bernsee. Sign = -1 is FFT, 1 is iFFT (inverse)
 Fills fftBuffer[0...2*fftFrameSize-1] with the Fourier transform of the
@@ -580,6 +270,7 @@ ie. when working with 'common' audio signals our input signal has to be
 passed as {in[0],0.,in[1],0.,in[2],0.,...} asf. In that case, the transform
 of the frequencies of interest is in fftBuffer[0...fftFrameSize].
 */
+void smbFft(float *fftBuffer, long fftFrameSize, long sign)
 {
 	float wr, wi, arg, *p1, *p2, temp;
 	float tr, ti, ur, ui, *p1r, *p1i, *p2r, *p2i;
@@ -625,106 +316,166 @@ of the frequencies of interest is in fftBuffer[0...fftFrameSize].
 	}
 }
 
-
-// -----------------------------------------------------------------------------------------------------------------
-
-/*
-
-12/12/02, smb
-
-PLEASE NOTE:
-
-There have been some reports on domain errors when the atan2() function was used
-as in the above code. Usually, a domain error should not interrupt the program flow
-(maybe except in Debug mode) but rather be handled "silently" and a global variable
-should be set according to this error. However, on some occasions people ran into
-this kind of scenario, so a replacement atan2() function is provided here.
-
-If you are experiencing domain errors and your program stops, simply replace all
-instances of atan2() with calls to the smbAtan2() function below.
-
-*/
-
-
-float smbAtan2(float x, float y)
+PitchShifter::PitchShifter()
+	: m_bInit(false)
+	, m_iRover(0)
+	, m_fPitchShifter(1.0)
+	, m_iFFTFrameSize(1024)
+	, m_iOverSample(4)
+	, m_iSampleRate(48000)
 {
-	float signx;
-	if (x > 0.0f) signx = 1.0f;
-	else signx = -1.0f;
 
-	if (x == 0.0f) return 0.0f;
-	if (y == 0.0f) return signx * M_PI / 2.0f;
+}
 
-	return fastAtan2(x, y);
+PitchShifter::~PitchShifter()
+{
+
 }
 
 
-#define _CRT_SECURE_NO_WARNINGS
-#define _CRT_SECURE_NO_DEPRECATE 1 
-#define _CRT_NONSTDC_NO_DEPRECATE 1
-#include <stdio.h>
-#include <stdlib.h>    
-#include <stdint.h>    
-#include <time.h> 
-#include <iostream> 
-//采用https://github.com/mackron/dr_libs/blob/master/dr_wav.h 解码
-#define DR_WAV_IMPLEMENTATION
-#include "Wave.h"
-//采用http://blogs.zynaptiq.com/bernsee/pitch-shifting-using-the-ft/
-
-auto const epoch = clock();
-static double now()
+void PitchShifter::Init(int iSemitone, int iFFTFrameSize, int iOverSample, int sampleRate)
 {
-	return  (clock() - epoch);
-};
-
-template <typename FN>
-static double bench(const FN &fn)
-{
-	auto took = -now();
-	return (fn(), took + now()) / 1000;
-}
-
-#include <windows.h>
-
-int main(int argc, char* argv[])
-{
-	std::cout << "Audio Processing " << std::endl;
-	std::cout << "支持解析单通道wav格式的变调处理." << std::endl;
-
-	WaveReader reader;
-	int iChannel, iSampleRate, iSampleBit;
-	std::string strFilePath = "60.wav";
-	reader.Open((char*)strFilePath.c_str(), iChannel, iSampleRate, iSampleBit);	
-	//如果加载成功
-	if (reader.IsOpen())
+	if (!m_bInit)
 	{
-		int iReadUnit = 8192 * 2;
-		char szReadBuf[8192 * 2];
-		int iRealReadSize = 0;
-		float semitones = 3;                            // 向上移动8个半音
-		float pitchShift = pow(2.0f, semitones / 12.0f);    //将半音转换为因子
-		printf("pitchShift:%f", pitchShift);
+		memset(m_fInFIFO, 0, MAX_FRAME_LENGTH * sizeof(float));
+		memset(m_fOutFIFO, 0, MAX_FRAME_LENGTH * sizeof(float));
+		memset(m_fFFTworksp, 0, 2 * MAX_FRAME_LENGTH * sizeof(float));
+		memset(m_fLastPhase, 0, (MAX_FRAME_LENGTH / 2 + 1) * sizeof(float));
+		memset(m_fSumPhase, 0, (MAX_FRAME_LENGTH / 2 + 1) * sizeof(float));
+		memset(m_fOutputAccum, 0, 2 * MAX_FRAME_LENGTH * sizeof(float));
+		memset(m_fAnaFreq, 0, MAX_FRAME_LENGTH * sizeof(float));
+		memset(m_fAnaMagn, 0, MAX_FRAME_LENGTH * sizeof(float));
 
-		WaveWriter writer;
-		writer.Open("pitchShift_03.wav", iChannel, iSampleRate, iSampleBit);
-		for (; ;)
-		{
-			iRealReadSize = reader.Read(szReadBuf, iReadUnit);
-			if (iRealReadSize > 0)
-			{
-				smbPitchShift2(pitchShift, iRealReadSize / 2, 2048, 4, iSampleRate, (short*)szReadBuf, (short*)szReadBuf);
-				writer.Write(szReadBuf, iRealReadSize);
-				Sleep(1.0*iRealReadSize / iSampleRate * 1000);
-			}
-			else
-			{
-				break;
-			}
-		}
-		writer.Close();
+		m_iRover = 0;
+		m_fPitchShifter = pow(2.0f, iSemitone / 12.0f);
+		m_iOverSample = iOverSample;
+		m_iFFTFrameSize = iFFTFrameSize;
+		m_iSampleRate = sampleRate;
+
+		printf("m_fPitchShifter:%g.\n", m_fPitchShifter);
+		m_bInit = true;
 	}
-	std::cout << "按任意键退出程序 \n" << std::endl;
-	getchar();
+}
+
+
+int PitchShifter::DoPitchShifter(short* psDataIn, int iDataSize, short* psDataOut)
+{
+	float fPhase, tmp, real, imag;
+
+	long qpd, index;
+	float M_2PI = 2.0f * M_PI;
+	float W_2PI = M_2PI / m_iFFTFrameSize;
+	/* set up some handy variables */
+	long fftFrameSize2 = m_iFFTFrameSize / 2;
+	long stepSize = m_iFFTFrameSize / m_iOverSample;
+	float freqPerBin = m_iSampleRate / (float)m_iFFTFrameSize;
+	float expct = W_2PI*(float)stepSize;
+	float pi_osamp = (M_2PI / m_iOverSample);
+	float pi_osamp_expct = pi_osamp + expct;
+	float pi_osamp_freqPerBin = pi_osamp / freqPerBin;
+	float osamp_freqPerBin = m_iOverSample * freqPerBin / M_2PI;
+	float fft_osamp = 1.0f / (fftFrameSize2 * m_iOverSample);
+
+	long inFifoLatency = m_iFFTFrameSize - stepSize;
+	if (m_iRover == 0)
+		m_iRover = inFifoLatency;
+
+	/* main processing loop */
+	int iSampleSum = iDataSize / 2;//总的采样数
+	for (int i = 0; i < iSampleSum; i++)
+	{
+		/* As long as we have not yet collected enough data just read in */
+		m_fInFIFO[m_iRover] = 1.0 * psDataIn[i] / 32768;
+		psDataOut[i] = m_fOutFIFO[m_iRover - inFifoLatency] * 32768;
+		m_iRover++;
+
+		/* now we have enough data for processing */
+		if (m_iRover >= m_iFFTFrameSize) {
+			m_iRover = inFifoLatency;
+
+			/* do windowing and re,im interleave */
+			float * sFFTworksp = m_fFFTworksp;
+			for (int k = 0; k < m_iFFTFrameSize; k++) {
+				sFFTworksp[0] = m_fInFIFO[k] * (-0.5f*fastcos(W_2PI*k) + 0.5f);
+				sFFTworksp[1] = 0.0f;
+				sFFTworksp += 2;
+			}
+			/* ***************** ANALYSIS ******************* */
+			/* do transform */
+			smbFft(m_fFFTworksp, m_iFFTFrameSize, -1);
+
+			/* this is the analysis step */
+			float *pFFTworksp = m_fFFTworksp;
+			for (int k = 0; k <= fftFrameSize2; k++) {
+				/* de-interlace FFT buffer */
+				real = pFFTworksp[0];
+				imag = pFFTworksp[1];
+				/* compute magnitude and phase */
+				m_fAnaMagn[k] = 2.0f * fastSqrt(real*real + imag*imag);
+				fPhase = fastAtan2(imag, real);
+				/* compute phase difference */
+				/* subtract expected phase difference */
+				tmp = (fPhase - m_fLastPhase[k]) - (float)k*expct;
+				m_fLastPhase[k] = fPhase;
+
+				/* map delta phase into +/- Pi interval */
+				qpd = tmp * M_1_PI;
+				if (qpd >= 0)
+					qpd += qpd & 1;
+				else
+					qpd -= qpd & 1;
+				/* get deviation from bin frequency from the +/- Pi interval */
+				/* compute the k-th partials' true frequency */
+				/* store magnitude and true frequency in analysis arrays */
+				m_fAnaFreq[k] = (k + (tmp - M_PI * qpd)  * osamp_freqPerBin);
+				pFFTworksp += 2;
+			}
+
+			/* ***************** PROCESSING ******************* */
+			/* this does the actual pitch shifting */
+			memset(m_fSynMagn, 0, m_iFFTFrameSize * sizeof(float));
+			memset(m_fSynFreq, 0, m_iFFTFrameSize * sizeof(float));
+			for (int k = 0; k <= fftFrameSize2; k++) {
+				index = k * m_fPitchShifter;
+				if (index <= fftFrameSize2) {
+					m_fSynMagn[index] += m_fAnaMagn[k];
+					m_fSynFreq[index] = m_fAnaFreq[k] * m_fPitchShifter;
+				}
+			}
+
+			/* ***************** SYNTHESIS ******************* */
+			/* this is the synthesis step */
+			float *tFFTworksp = m_fFFTworksp;
+			for (int k = 0; k <= fftFrameSize2; k++) {
+				m_fSumPhase[k] += pi_osamp_freqPerBin * m_fSynFreq[k] - pi_osamp_expct*k;
+				tFFTworksp[0] = m_fSynMagn[k] * fastcos(m_fSumPhase[k]);
+				tFFTworksp[1] = m_fSynMagn[k] * fastsin(m_fSumPhase[k]);
+				tFFTworksp += 2;
+			}
+
+			/* zero negative frequencies */
+			memset(m_fFFTworksp + (m_iFFTFrameSize + 2), 0, sizeof(float) * 2 * m_iFFTFrameSize);
+			/* do inverse transform */
+			smbFft(m_fFFTworksp, m_iFFTFrameSize, 1);
+			/* do windowing and add to output accumulator */
+			float *ppFFTworksp = m_fFFTworksp;
+			for (int k = 0; k < m_iFFTFrameSize; k++) {
+				m_fOutputAccum[k] += (-fastcos(W_2PI * k) *ppFFTworksp[0] * fft_osamp) + ppFFTworksp[0] * fft_osamp;
+				ppFFTworksp += 2;
+			}
+			memcpy(m_fOutFIFO, m_fOutputAccum, stepSize * sizeof(float));
+			/* shift accumulator */
+			memmove(m_fOutputAccum, m_fOutputAccum + stepSize, m_iFFTFrameSize * sizeof(float));
+			/* move input FIFO */
+			memcpy(m_fInFIFO, m_fInFIFO + stepSize, sizeof(float)*inFifoLatency);
+		}
+	}
+
 	return 0;
+}
+
+void PitchShifter::Uninit()
+{
+	//nothing to do
+	m_bInit = false;
 }

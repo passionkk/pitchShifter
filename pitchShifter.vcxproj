@@ -76,10 +76,12 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="pitchshifter.cpp" />
+    <ClCompile Include="main.cpp" />
+    <ClCompile Include="PitchShifter.cpp" />
     <ClCompile Include="Wave.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="PitchShifter.h" />
     <ClInclude Include="Wave.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
