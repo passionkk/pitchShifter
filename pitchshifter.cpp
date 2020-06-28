@@ -317,12 +317,12 @@ void smbFft(float *fftBuffer, long fftFrameSize, long sign)
 }
 
 PitchShifter::PitchShifter()
-	: m_bInit(false)
-	, m_iRover(0)
+	: m_iRover(0)
 	, m_fPitchShifter(1.0)
 	, m_iFFTFrameSize(1024)
 	, m_iOverSample(4)
 	, m_iSampleRate(48000)
+	, m_f2M_PI(2*M_PI)
 {
 
 }
@@ -335,47 +335,38 @@ PitchShifter::~PitchShifter()
 
 void PitchShifter::Init(int iSemitone, int iFFTFrameSize, int iOverSample, int sampleRate)
 {
-	if (!m_bInit)
-	{
-		memset(m_fInFIFO, 0, MAX_FRAME_LENGTH * sizeof(float));
-		memset(m_fOutFIFO, 0, MAX_FRAME_LENGTH * sizeof(float));
-		memset(m_fFFTworksp, 0, 2 * MAX_FRAME_LENGTH * sizeof(float));
-		memset(m_fLastPhase, 0, (MAX_FRAME_LENGTH / 2 + 1) * sizeof(float));
-		memset(m_fSumPhase, 0, (MAX_FRAME_LENGTH / 2 + 1) * sizeof(float));
-		memset(m_fOutputAccum, 0, 2 * MAX_FRAME_LENGTH * sizeof(float));
-		memset(m_fAnaFreq, 0, MAX_FRAME_LENGTH * sizeof(float));
-		memset(m_fAnaMagn, 0, MAX_FRAME_LENGTH * sizeof(float));
+	memset(m_fInFIFO, 0, MAX_FRAME_LENGTH * sizeof(float));
+	memset(m_fOutFIFO, 0, MAX_FRAME_LENGTH * sizeof(float));
+	memset(m_fFFTworksp, 0, 2 * MAX_FRAME_LENGTH * sizeof(float));
+	memset(m_fLastPhase, 0, (MAX_FRAME_LENGTH / 2 + 1) * sizeof(float));
+	memset(m_fSumPhase, 0, (MAX_FRAME_LENGTH / 2 + 1) * sizeof(float));
+	memset(m_fOutputAccum, 0, 2 * MAX_FRAME_LENGTH * sizeof(float));
+	memset(m_fAnaFreq, 0, MAX_FRAME_LENGTH * sizeof(float));
+	memset(m_fAnaMagn, 0, 2 * MAX_FRAME_LENGTH * sizeof(float));
+	memset(m_fSynFreq, 0, 2 * MAX_FRAME_LENGTH * sizeof(float));
+	memset(m_fSynMagn, 0, MAX_FRAME_LENGTH * sizeof(float));
 
-		m_iRover = 0;
-		m_fPitchShifter = pow(2.0f, iSemitone / 12.0f);
-		m_iOverSample = iOverSample;
-		m_iFFTFrameSize = iFFTFrameSize;
-		m_iSampleRate = sampleRate;
-
-		printf("m_fPitchShifter:%g.\n", m_fPitchShifter);
-		m_bInit = true;
-	}
+	m_iRover = 0;
+	m_fPitchShifter = pow(2.0f, iSemitone / 12.0f);
+	m_iOverSample = iOverSample;
+	m_iFFTFrameSize = iFFTFrameSize;
+	m_iSampleRate = sampleRate;
+	m_f2M_PI = 2.0f * M_PI;
 }
 
 
-int PitchShifter::DoPitchShifter(short* psDataIn, int iDataSize, short* psDataOut)
+int PitchShifter::ProcessData(short* psDataIn, int iDataSize, short* psDataOut)
 {
 	float fPhase, tmp, real, imag;
 
 	long qpd, index;
-	float M_2PI = 2.0f * M_PI;
-	float W_2PI = M_2PI / m_iFFTFrameSize;
+
 	/* set up some handy variables */
 	long fftFrameSize2 = m_iFFTFrameSize / 2;
 	long stepSize = m_iFFTFrameSize / m_iOverSample;
 	float freqPerBin = m_iSampleRate / (float)m_iFFTFrameSize;
-	float expct = W_2PI*(float)stepSize;
-	float pi_osamp = (M_2PI / m_iOverSample);
-	float pi_osamp_expct = pi_osamp + expct;
-	float pi_osamp_freqPerBin = pi_osamp / freqPerBin;
-	float osamp_freqPerBin = m_iOverSample * freqPerBin / M_2PI;
-	float fft_osamp = 1.0f / (fftFrameSize2 * m_iOverSample);
-
+	float expct = m_f2M_PI*(float)stepSize / m_iFFTFrameSize;
+	float window;
 	long inFifoLatency = m_iFFTFrameSize - stepSize;
 	if (m_iRover == 0)
 		m_iRover = inFifoLatency;
@@ -385,8 +376,8 @@ int PitchShifter::DoPitchShifter(short* psDataIn, int iDataSize, short* psDataOu
 	for (int i = 0; i < iSampleSum; i++)
 	{
 		/* As long as we have not yet collected enough data just read in */
-		m_fInFIFO[m_iRover] = 1.0 * psDataIn[i] / 32768;
-		psDataOut[i] = m_fOutFIFO[m_iRover - inFifoLatency] * 32768;
+		m_fInFIFO[m_iRover] = psDataIn[i] / 32768.f;
+		psDataOut[i] = m_fOutFIFO[m_iRover - inFifoLatency] * 32768.f;
 		m_iRover++;
 
 		/* now we have enough data for processing */
@@ -396,7 +387,9 @@ int PitchShifter::DoPitchShifter(short* psDataIn, int iDataSize, short* psDataOu
 			/* do windowing and re,im interleave */
 			float * sFFTworksp = m_fFFTworksp;
 			for (int k = 0; k < m_iFFTFrameSize; k++) {
-				sFFTworksp[0] = m_fInFIFO[k] * (-0.5f*fastcos(W_2PI*k) + 0.5f);
+				window = -0.5 * fastcos(2.*M_PI*(double)k / (double)m_iFFTFrameSize) + 0.5;
+				sFFTworksp[0] = m_fInFIFO[k] * window;
+				//sFFTworksp[0] = m_fInFIFO[k] * (-0.5f*fastcos(W_2PI*k) + 0.5f);
 				sFFTworksp[1] = 0.0f;
 				sFFTworksp += 2;
 			}
@@ -410,13 +403,17 @@ int PitchShifter::DoPitchShifter(short* psDataIn, int iDataSize, short* psDataOu
 				/* de-interlace FFT buffer */
 				real = pFFTworksp[0];
 				imag = pFFTworksp[1];
+				pFFTworksp += 2;
+
 				/* compute magnitude and phase */
 				m_fAnaMagn[k] = 2.0f * fastSqrt(real*real + imag*imag);
 				fPhase = fastAtan2(imag, real);
 				/* compute phase difference */
-				/* subtract expected phase difference */
-				tmp = (fPhase - m_fLastPhase[k]) - (float)k*expct;
+				tmp = (fPhase - m_fLastPhase[k])/* - (float)k*expct*/;
 				m_fLastPhase[k] = fPhase;
+
+				/* subtract expected phase difference */
+				tmp -= (float)k*expct;
 
 				/* map delta phase into +/- Pi interval */
 				qpd = tmp * M_1_PI;
@@ -424,11 +421,16 @@ int PitchShifter::DoPitchShifter(short* psDataIn, int iDataSize, short* psDataOu
 					qpd += qpd & 1;
 				else
 					qpd -= qpd & 1;
+
+				tmp -= M_PI*(double)qpd;
 				/* get deviation from bin frequency from the +/- Pi interval */
+				tmp = m_iOverSample*tmp / (2.*M_PI);
+
 				/* compute the k-th partials' true frequency */
+				tmp = (double)k*freqPerBin + tmp*freqPerBin;
+
 				/* store magnitude and true frequency in analysis arrays */
-				m_fAnaFreq[k] = (k + (tmp - M_PI * qpd)  * osamp_freqPerBin);
-				pFFTworksp += 2;
+				m_fAnaFreq[k] = tmp;
 			}
 
 			/* ***************** PROCESSING ******************* */
@@ -447,7 +449,24 @@ int PitchShifter::DoPitchShifter(short* psDataIn, int iDataSize, short* psDataOu
 			/* this is the synthesis step */
 			float *tFFTworksp = m_fFFTworksp;
 			for (int k = 0; k <= fftFrameSize2; k++) {
-				m_fSumPhase[k] += pi_osamp_freqPerBin * m_fSynFreq[k] - pi_osamp_expct*k;
+				/* get magnitude and true frequency from synthesis arrays */
+				tmp = m_fSynFreq[k];
+
+				/* subtract bin mid frequency */
+				tmp -= (double)k*freqPerBin;
+
+				/* get bin deviation from freq deviation */
+				tmp /= freqPerBin;
+
+				/* take osamp into account */
+				tmp = 2.*M_PI*tmp / m_iOverSample;
+
+				/* add the overlap phase advance back in */
+				tmp += (double)k*expct;
+
+				/* accumulate delta phase to get bin phase */
+				m_fSumPhase[k] += tmp;
+
 				tFFTworksp[0] = m_fSynMagn[k] * fastcos(m_fSumPhase[k]);
 				tFFTworksp[1] = m_fSynMagn[k] * fastsin(m_fSumPhase[k]);
 				tFFTworksp += 2;
@@ -460,7 +479,9 @@ int PitchShifter::DoPitchShifter(short* psDataIn, int iDataSize, short* psDataOu
 			/* do windowing and add to output accumulator */
 			float *ppFFTworksp = m_fFFTworksp;
 			for (int k = 0; k < m_iFFTFrameSize; k++) {
-				m_fOutputAccum[k] += (-fastcos(W_2PI * k) *ppFFTworksp[0] * fft_osamp) + ppFFTworksp[0] * fft_osamp;
+				window = -0.5*cos(2.0*M_PI*(double)k / (double)m_iFFTFrameSize) + 0.5;
+				m_fOutputAccum[k] += 2.0*window*ppFFTworksp[0] / (fftFrameSize2*m_iOverSample);
+
 				ppFFTworksp += 2;
 			}
 			memcpy(m_fOutFIFO, m_fOutputAccum, stepSize * sizeof(float));
@@ -472,10 +493,4 @@ int PitchShifter::DoPitchShifter(short* psDataIn, int iDataSize, short* psDataOu
 	}
 
 	return 0;
-}
-
-void PitchShifter::Uninit()
-{
-	//nothing to do
-	m_bInit = false;
 }
